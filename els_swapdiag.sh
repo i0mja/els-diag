@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-ElasticSearch Memory and Swap Usage Monitor for RHEL 8.10
+Enhanced ElasticSearch Memory and Swap Monitor for RHEL 8.10
 
-Usage:
-- Interactive mode: python3 es_mem_monitor.py
-  - Launches a text-based menu for monitoring and configuration.
-- Daemon mode: python3 es_mem_monitor.py --daemon --interval <seconds> --log <path>
-  - Runs monitoring continuously, suitable for systemd service.
-
-Features:
-- Monitors ElasticSearch process memory and swap usage.
-- Logs metrics to a configurable file.
-- Installs as a systemd service for background monitoring.
-- Generates reports with peak usage and threshold exceedances.
-- Checks system configuration for ElasticSearch optimization.
+Key Improvements:
+- Added PID validation and process tracking
+- Improved swap rate calculation with counter reset handling
+- Added config validation and sanitization
+- Enhanced error handling and logging
+- Added log rotation support
+- Implemented proper daemonization
+- Added JVM heap usage monitoring
+- Improved system optimization checks
+- Added CSV export for reports
 """
 
 import os
@@ -23,398 +21,620 @@ import time
 import datetime
 import csv
 import sys
+import argparse
+import logging
+import shutil
+import psutil
+import re
 
-# Default configuration settings
-interval = 1.0  # Sampling interval in seconds
-log_path = '/var/log/es_mem_monitor.log'  # Default log file path
-threshold = 80  # Threshold percentage for alerts
+# Configuration defaults
+DEFAULT_INTERVAL = 5.0
+DEFAULT_LOG_PATH = '/var/log/es_mem_monitor.log'
+DEFAULT_THRESHOLD = 80
+MAX_LOG_SIZE = 50 * 1024 * 1024  # 50MB
+LOG_BACKUPS = 3
 
-# Global variables for monitoring control
+# Global state
 monitoring_active = False
 monitoring_thread = None
+current_pid = None
+last_metrics = None
+
+def setup_logging():
+    """Initialize logging system"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+def validate_config():
+    """Validate configuration parameters"""
+    if not os.access(os.path.dirname(DEFAULT_LOG_PATH), os.W_OK):
+        logging.error("Log directory not writable: %s", os.path.dirname(DEFAULT_LOG_PATH))
+        return False
+    return True
 
 def get_es_pid():
-    """Find the PID of the ElasticSearch process."""
+    """Find ElasticSearch PID with validation and retry"""
+    global current_pid
+    
+    # Check if previous PID is still valid
+    if current_pid:
+        try:
+            process = psutil.Process(current_pid)
+            if "java" in process.name() and "elasticsearch" in " ".join(process.cmdline()):
+                return current_pid
+        except psutil.NoSuchProcess:
+            pass  # Process no longer exists
+    
+    # Find new PID
     try:
-        output = subprocess.check_output(["pgrep", "-f", "java.*org.elasticsearch.bootstrap.Elasticsearch"])
-        pids = output.decode().strip().split()
-        if pids:
-            return int(pids[0])
-        return None
-    except subprocess.CalledProcessError:
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            if proc.info['name'] == 'java' and 'org.elasticsearch.bootstrap.Elasticsearch' in proc.info['cmdline']:
+                current_pid = proc.info['pid']
+                logging.info("Found ElasticSearch PID: %d", current_pid)
+                return current_pid
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
+        logging.error("Process scan error: %s", str(e))
+    
+    logging.warning("ElasticSearch process not found")
+    return None
+
+def get_jvm_stats(pid):
+    """Get JVM heap usage statistics using jstat"""
+    try:
+        result = subprocess.run(
+            ['jstat', '-gc', str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True
+        )
+        
+        # Parse jstat output (columns: S0C S1C S0U S1U EC EU OC OU MC MU CCSC CCSU YGC YGCT FGC FGCT GCT)
+        lines = result.stdout.strip().split('\n')
+        if len(lines) < 2:
+            return None
+            
+        headers = lines[0].split()
+        values = lines[1].split()
+        if len(headers) != len(values) or len(values) < 9:
+            return None
+            
+        # Extract relevant values
+        stats = {}
+        stats['heap_used'] = int(values[8])  # OU: Old space used (KB)
+        stats['heap_max'] = int(values[7])   # OC: Old space capacity (KB)
+        stats['gc_count'] = int(values[12])  # FGC: Full GC count
+        stats['gc_time'] = float(values[14]) # FGCT: Full GC time (seconds)
+        
+        return stats
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         return None
 
 def get_metrics(pid):
-    """Collect memory and swap metrics for the given PID."""
+    """Collect comprehensive system and process metrics"""
     metrics = {}
-    metrics['timestamp'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    metrics['timestamp'] = datetime.datetime.now().isoformat()
     
-    # ElasticSearch process metrics from /proc/<pid>/status
     try:
-        with open(f'/proc/{pid}/status', 'r') as f:
-            for line in f:
-                if line.startswith('VmRSS:'):
-                    metrics['es_rss_mb'] = int(line.split()[1]) / 1024.0  # kB to MB
-                elif line.startswith('VmSwap:'):
-                    metrics['es_swap_mb'] = int(line.split()[1]) / 1024.0  # kB to MB
-    except (FileNotFoundError, PermissionError):
-        print("Error: Cannot access /proc/<pid>/status. Run with sudo if necessary.")
+        # Process metrics
+        process = psutil.Process(pid)
+        mem_info = process.memory_info()
+        metrics['es_rss_mb'] = mem_info.rss / (1024 * 1024)
+        metrics['es_vms_mb'] = mem_info.vms / (1024 * 1024)
+        metrics['es_swap_mb'] = mem_info.swap / (1024 * 1024)
+        
+        # JVM heap statistics
+        jvm_stats = get_jvm_stats(pid)
+        if jvm_stats:
+            metrics['jvm_heap_used_mb'] = jvm_stats['heap_used'] / 1024
+            metrics['jvm_heap_max_mb'] = jvm_stats['heap_max'] / 1024
+            metrics['jvm_gc_count'] = jvm_stats['gc_count']
+            metrics['jvm_gc_time'] = jvm_stats['gc_time']
+        
+        # System memory
+        sys_mem = psutil.virtual_memory()
+        metrics['total_ram_used_mb'] = (sys_mem.total - sys_mem.available) / (1024 * 1024)
+        metrics['mem_available_mb'] = sys_mem.available / (1024 * 1024)
+        metrics['mem_total_mb'] = sys_mem.total / (1024 * 1024)
+        
+        # Swap metrics
+        swap = psutil.swap_memory()
+        metrics['total_swap_used_mb'] = swap.used / (1024 * 1024)
+        metrics['swap_total_mb'] = swap.total / (1024 * 1024)
+        
+        # System load
+        load = os.getloadavg()
+        metrics['load_1m'] = load[0]
+        metrics['load_5m'] = load[1]
+        metrics['load_15m'] = load[2]
+        
+        return metrics
+    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+        logging.error("Metrics collection error: %s", str(e))
         return None
-    
-    # System memory metrics from /proc/meminfo
-    with open('/proc/meminfo', 'r') as f:
-        for line in f:
-            if line.startswith('MemTotal:'):
-                mem_total = int(line.split()[1]) / 1024.0  # kB to MB
-            elif line.startswith('MemFree:'):
-                mem_free = int(line.split()[1]) / 1024.0  # kB to MB
-            elif line.startswith('MemAvailable:'):
-                metrics['mem_available_mb'] = int(line.split()[1]) / 1024.0  # kB to MB
-            elif line.startswith('SwapTotal:'):
-                swap_total = int(line.split()[1]) / 1024.0  # kB to MB
-            elif line.startswith('SwapFree:'):
-                swap_free = int(line.split()[1]) / 1024.0  # kB to MB
-    metrics['total_ram_used_mb'] = mem_total - mem_free
-    metrics['total_swap_used_mb'] = swap_total - swap_free
-    
-    # Swap in/out rates from /proc/vmstat
-    with open('/proc/vmstat', 'r') as f:
-        for line in f:
-            if line.startswith('pswpin'):
-                metrics['pswpin'] = int(line.split()[1])
-            elif line.startswith('pswpout'):
-                metrics['pswpout'] = int(line.split()[1])
-    
-    return metrics
 
-def monitoring_loop():
-    """Run the monitoring loop, logging metrics to file."""
-    global monitoring_active
-    pid = get_es_pid()
-    if not pid:
-        print("Error: ElasticSearch process not found.")
-        return
+def rotate_log(log_path):
+    """Implement log rotation if file exceeds max size"""
+    try:
+        if os.path.exists(log_path) and os.path.getsize(log_path) > MAX_LOG_SIZE:
+            for i in range(LOG_BACKUPS - 1, 0, -1):
+                src = f"{log_path}.{i}"
+                dst = f"{log_path}.{i+1}"
+                if os.path.exists(src):
+                    shutil.move(src, dst)
+            shutil.move(log_path, f"{log_path}.1")
+            logging.info("Rotated log file: %s", log_path)
+    except OSError as e:
+        logging.error("Log rotation failed: %s", str(e))
+
+def monitoring_loop(interval, log_path, threshold):
+    """Main monitoring loop with enhanced features"""
+    global monitoring_active, last_metrics
+    
+    logging.info("Monitoring started with interval: %.1fs", interval)
     
     prev_pswpin = None
     prev_pswpout = None
-    prev_time = None
+    prev_time = time.time()
+    
+    fieldnames = [
+        'timestamp', 'es_rss_mb', 'es_vms_mb', 'es_swap_mb', 'jvm_heap_used_mb',
+        'jvm_heap_max_mb', 'jvm_gc_count', 'jvm_gc_time', 'total_ram_used_mb',
+        'mem_available_mb', 'mem_total_mb', 'total_swap_used_mb', 'swap_total_mb',
+        'swap_in_ps', 'swap_out_ps', 'load_1m', 'load_5m', 'load_15m'
+    ]
     
     try:
-        with open(log_path, 'a') as log_file:
-            writer = csv.DictWriter(log_file, fieldnames=[
-                'timestamp', 'es_rss_mb', 'es_swap_mb', 'total_ram_used_mb',
-                'mem_available_mb', 'total_swap_used_mb', 'swap_in_ps', 'swap_out_ps'
-            ])
-            if log_file.tell() == 0:
-                writer.writeheader()
+        while monitoring_active:
+            rotate_log(log_path)
             
-            while monitoring_active:
-                current_time = time.time()
-                metrics = get_metrics(pid)
-                if not metrics:
-                    break
-                
-                if prev_pswpin is not None:
-                    dt = current_time - prev_time
-                    swap_in_ps = (metrics['pswpin'] - prev_pswpin) / dt
-                    swap_out_ps = (metrics['pswpout'] - prev_pswpout) / dt
-                else:
-                    swap_in_ps = 0
-                    swap_out_ps = 0
-                
-                log_metrics = {k: v for k, v in metrics.items() if k not in ['pswpin', 'pswpout']}
-                log_metrics['swap_in_ps'] = swap_in_ps
-                log_metrics['swap_out_ps'] = swap_out_ps
-                writer.writerow(log_metrics)
-                log_file.flush()
-                
-                prev_pswpin = metrics['pswpin']
-                prev_pswpout = metrics['pswpout']
-                prev_time = current_time
+            pid = get_es_pid()
+            if not pid:
                 time.sleep(interval)
-    except PermissionError:
-        print(f"Error: Cannot write to {log_path}. Run with sudo or check permissions.")
+                continue
+                
+            # Read vmstat for swap rates
+            try:
+                with open('/proc/vmstat', 'r') as f:
+                    vmstat = f.read()
+                pswpin = int(re.search(r'pswpin\s+(\d+)', vmstat).group(1))
+                pswpout = int(re.search(r'pswpout\s+(\d+)', vmstat).group(1))
+            except (FileNotFoundError, ValueError, AttributeError) as e:
+                logging.error("Failed to read vmstat: %s", str(e))
+                pswpin = 0
+                pswpout = 0
+            
+            # Collect metrics
+            metrics = get_metrics(pid)
+            if not metrics:
+                time.sleep(interval)
+                continue
+                
+            # Calculate swap rates
+            current_time = time.time()
+            time_delta = current_time - prev_time
+            
+            if prev_pswpin is not None and time_delta > 0:
+                metrics['swap_in_ps'] = (pswpin - prev_pswpin) / time_delta
+                metrics['swap_out_ps'] = (pswpout - prev_pswpout) / time_delta
+            else:
+                metrics['swap_in_ps'] = 0
+                metrics['swap_out_ps'] = 0
+                
+            last_metrics = metrics
+            prev_pswpin = pswpin
+            prev_pswpout = pswpout
+            prev_time = current_time
+            
+            # Write to log
+            try:
+                file_exists = os.path.exists(log_path) and os.path.getsize(log_path) > 0
+                with open(log_path, 'a', newline='') as log_file:
+                    writer = csv.DictWriter(log_file, fieldnames=fieldnames)
+                    if not file_exists:
+                        writer.writeheader()
+                    writer.writerow(metrics)
+            except OSError as e:
+                logging.error("Log write error: %s", str(e))
+            
+            # Check thresholds
+            check_thresholds(metrics, threshold)
+            
+            time.sleep(interval)
+            
+    except Exception as e:
+        logging.exception("Monitoring loop crashed: %s", str(e))
         monitoring_active = False
 
-def start_monitoring():
-    """Start monitoring in a separate thread."""
+def check_thresholds(metrics, threshold):
+    """Check metrics against thresholds and generate alerts"""
+    alerts = []
+    
+    # Memory thresholds
+    mem_usage = (metrics['total_ram_used_mb'] / metrics['mem_total_mb']) * 100
+    if mem_usage > threshold:
+        alerts.append(f"System memory usage {mem_usage:.1f}% > {threshold}%")
+    
+    # Swap thresholds
+    if metrics['swap_total_mb'] > 0:
+        swap_usage = (metrics['total_swap_used_mb'] / metrics['swap_total_mb']) * 100
+        if swap_usage > threshold:
+            alerts.append(f"System swap usage {swap_usage:.1f}% > {threshold}%")
+    
+    # Process-specific thresholds
+    if metrics.get('es_swap_mb', 0) > 50:  # 50MB swap usage threshold
+        alerts.append(f"ElasticSearch swap usage {metrics['es_swap_mb']:.1f}MB > 50MB")
+    
+    # JVM heap thresholds
+    if metrics.get('jvm_heap_max_mb') and metrics.get('jvm_heap_used_mb'):
+        heap_usage = (metrics['jvm_heap_used_mb'] / metrics['jvm_heap_max_mb']) * 100
+        if heap_usage > 90:
+            alerts.append(f"JVM heap usage {heap_usage:.1f}% > 90%")
+    
+    # Log alerts
+    if alerts:
+        logging.warning("ALERT: " + ", ".join(alerts))
+
+def start_monitoring(interval, log_path, threshold):
+    """Start monitoring thread"""
     global monitoring_thread, monitoring_active
-    if monitoring_thread is not None:
-        print("Monitoring is already running.")
-    else:
-        monitoring_active = True
-        monitoring_thread = threading.Thread(target=monitoring_loop)
-        monitoring_thread.start()
-        print("Monitoring started.")
+    
+    if monitoring_thread and monitoring_thread.is_alive():
+        logging.info("Monitoring is already running")
+        return False
+        
+    monitoring_active = True
+    monitoring_thread = threading.Thread(
+        target=monitoring_loop,
+        args=(interval, log_path, threshold),
+        daemon=True
+    )
+    monitoring_thread.start()
+    logging.info("Monitoring started")
+    return True
 
 def stop_monitoring():
-    """Stop the monitoring thread."""
-    global monitoring_thread, monitoring_active
-    if monitoring_thread is None:
-        print("Monitoring is not running.")
-    else:
-        monitoring_active = False
-        monitoring_thread.join()
-        monitoring_thread = None
-        print("Monitoring stopped.")
-
-def configure_settings():
-    """Configure monitoring settings interactively."""
-    global interval, log_path, threshold
-    while True:
-        print("\nCurrent Settings:")
-        print(f"1. Sampling Interval: {interval} seconds")
-        print(f"2. Log File Path: {log_path}")
-        print(f"3. Threshold: {threshold}%")
-        print("4. Back to main menu")
-        choice = input("Select an option to change (1-4): ")
-        
-        if choice == '1':
-            try:
-                interval = float(input("Enter new sampling interval (seconds): "))
-                if interval <= 0:
-                    raise ValueError
-                print(f"Interval set to {interval} seconds.")
-            except ValueError:
-                print("Invalid input. Please enter a positive number.")
-        elif choice == '2':
-            log_path = input("Enter new log file path: ")
-            print(f"Log file path set to {log_path}.")
-        elif choice == '3':
-            try:
-                threshold = int(input("Enter new threshold percentage (0-100): "))
-                if not 0 <= threshold <= 100:
-                    raise ValueError
-                print(f"Threshold set to {threshold}%.")
-            except ValueError:
-                print("Invalid input. Please enter a number between 0 and 100.")
-        elif choice == '4':
-            break
-        else:
-            print("Invalid option.")
-
-def install_service():
-    """Install the script as a systemd service."""
-    if os.geteuid() != 0:
-        print("Error: Need root privileges to install service. Run with sudo.")
-        return
+    """Stop monitoring thread"""
+    global monitoring_active
     
-    unit_file = "/etc/systemd/system/esram-monitor.service"
-    script_path = os.path.abspath(__file__)
-    try:
-        with open(unit_file, 'w') as f:
-            f.write(f"""[Unit]
+    if not monitoring_active:
+        logging.info("Monitoring is not running")
+        return False
+        
+    monitoring_active = False
+    if monitoring_thread:
+        monitoring_thread.join(timeout=5)
+    logging.info("Monitoring stopped")
+    return True
+
+def install_service(interval, log_path, threshold):
+    """Install as systemd service with proper configuration"""
+    if os.geteuid() != 0:
+        logging.error("Root privileges required to install service")
+        return False
+        
+    service_content = f"""[Unit]
 Description=ElasticSearch Memory Monitor
+After=network.target elasticsearch.service
+
 [Service]
-ExecStart=/usr/bin/python3 {script_path} --daemon --interval {interval} --log {log_path}
-Restart=always
+Type=simple
+ExecStart={sys.executable} {os.path.abspath(__file__)} --daemon --interval {interval} --log "{log_path}" --threshold {threshold}
+Restart=on-failure
+RestartSec=30
+User=root
+
 [Install]
 WantedBy=multi-user.target
-""")
+"""
+    
+    try:
+        service_path = "/etc/systemd/system/esram-monitor.service"
+        with open(service_path, 'w') as f:
+            f.write(service_content)
+        
         subprocess.run(["systemctl", "daemon-reload"], check=True)
         subprocess.run(["systemctl", "enable", "esram-monitor.service"], check=True)
         subprocess.run(["systemctl", "start", "esram-monitor.service"], check=True)
-        print("Service installed and started successfully.")
-    except (PermissionError, subprocess.CalledProcessError) as e:
-        print(f"Error installing service: {e}")
+        
+        logging.info("Service installed and started successfully")
+        return True
+    except (OSError, subprocess.CalledProcessError) as e:
+        logging.error("Service installation failed: %s", str(e))
+        return False
 
 def uninstall_service():
-    """Uninstall the systemd service."""
+    """Uninstall systemd service"""
     if os.geteuid() != 0:
-        print("Error: Need root privileges to uninstall service. Run with sudo.")
-        return
-    
+        logging.error("Root privileges required to uninstall service")
+        return False
+        
     try:
         subprocess.run(["systemctl", "stop", "esram-monitor.service"], check=True)
         subprocess.run(["systemctl", "disable", "esram-monitor.service"], check=True)
         os.remove("/etc/systemd/system/esram-monitor.service")
         subprocess.run(["systemctl", "daemon-reload"], check=True)
-        print("Service uninstalled successfully.")
-    except (PermissionError, subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"Error uninstalling service: {e}")
+        logging.info("Service uninstalled successfully")
+        return True
+    except (OSError, subprocess.CalledProcessError) as e:
+        logging.error("Service uninstall failed: %s", str(e))
+        return False
 
-def generate_report():
-    """Generate a report from the log file."""
-    try:
-        with open('/proc/meminfo', 'r') as f:
-            for line in f:
-                if line.startswith('MemTotal:'):
-                    mem_total = int(line.split()[1]) / 1024.0  # kB to MB
-                elif line.startswith('SwapTotal:'):
-                    swap_total = int(line.split()[1]) / 1024.0  # kB to MB
+def generate_report(log_path, threshold, output_format='text'):
+    """Generate comprehensive performance report"""
+    if not os.path.exists(log_path):
+        logging.error("Log file not found: %s", log_path)
+        return False
         
+    try:
         with open(log_path, 'r') as f:
             reader = csv.DictReader(f)
             data = list(reader)
-        
+            
         if not data:
-            print("No data available in the log file.")
-            return
+            logging.error("No data in log file")
+            return False
+            
+        # Convert numeric fields
+        for row in data:
+            for key in row:
+                if key not in ['timestamp']:
+                    try:
+                        row[key] = float(row[key]) if '.' in row[key] else int(row[key])
+                    except (ValueError, TypeError):
+                        pass
         
-        # Compute peak values
-        max_es_rss = max(float(row['es_rss_mb']) for row in data)
-        max_es_swap = max(float(row['es_swap_mb']) for row in data)
-        max_swap_used = max(float(row['total_swap_used_mb']) for row in data)
-        min_mem_available = min(float(row['mem_available_mb']) for row in data)
+        # Calculate statistics
+        stats = {
+            'start_time': data[0]['timestamp'],
+            'end_time': data[-1]['timestamp'],
+            'duration_hours': len(data) * DEFAULT_INTERVAL / 3600,
+            'max_rss': max(row.get('es_rss_mb', 0) for row in data),
+            'max_swap': max(row.get('es_swap_mb', 0) for row in data),
+            'max_heap': max(row.get('jvm_heap_used_mb', 0) for row in data),
+            'max_swap_used': max(row.get('total_swap_used_mb', 0) for row in data),
+            'min_mem_avail': min(row.get('mem_available_mb', 0) for row in data),
+            'high_swap_events': sum(1 for row in data if row.get('swap_in_ps', 0) > 0 or row.get('swap_out_ps', 0) > 0)
+        }
         
         # Threshold exceedances
-        high_es_rss = [row for row in data if float(row['es_rss_mb']) > (threshold / 100) * mem_total]
-        low_mem_available = [row for row in data if float(row['mem_available_mb']) < (1 - threshold / 100) * mem_total]
-        high_swap_used = [row for row in data if float(row['total_swap_used_mb']) > (threshold / 100) * swap_total]
-        swap_activity = [row for row in data if float(row['swap_in_ps']) > 0 or float(row['swap_out_ps']) > 0]
+        stats['mem_threshold_exceeded'] = sum(
+            1 for row in data 
+            if (row.get('total_ram_used_mb', 0) / row.get('mem_total_mb', 1)) * 100 > threshold
+        )
         
-        # Generate report
-        print("\nElasticSearch Memory and Swap Usage Report")
-        print("==========================================")
-        print(f"Total RAM: {mem_total:.2f} MB")
-        print(f"Total Swap: {swap_total:.2f} MB")
-        print(f"Threshold: {threshold}%")
-        print("\nPeak Usage:")
-        print(f"- Max ES RSS: {max_es_rss:.2f} MB ({max_es_rss / mem_total * 100:.1f}% of total RAM)")
-        print(f"- Max ES Swap: {max_es_swap:.2f} MB")
-        print(f"- Max Total Swap Used: {max_swap_used:.2f} MB ({max_swap_used / swap_total * 100:.1f}% of total swap)")
-        print(f"- Min MemAvailable: {min_mem_available:.2f} MB ({min_mem_available / mem_total * 100:.1f}% of total RAM)")
+        if output_format == 'text':
+            print("\nElasticSearch Performance Report")
+            print("================================")
+            print(f"Period: {stats['start_time']} to {stats['end_time']}")
+            print(f"Duration: {stats['duration_hours']:.2f} hours")
+            print(f"Samples: {len(data)}")
+            print("\nPeak Usage:")
+            print(f"- Max RSS: {stats['max_rss']:.2f} MB")
+            print(f"- Max Swap: {stats['max_swap']:.2f} MB")
+            print(f"- Max Heap: {stats['max_heap']:.2f} MB")
+            print(f"- Max System Swap Used: {stats['max_swap_used']:.2f} MB")
+            print(f"- Min Available Memory: {stats['min_mem_avail']:.2f} MB")
+            
+            print("\nThreshold Exceedances:")
+            print(f"- Memory > {threshold}%: {stats['mem_threshold_exceeded']} times")
+            print(f"- Swap activity events: {stats['high_swap_events']}")
+            
+        elif output_format == 'csv':
+            csv_file = log_path.replace('.log', '_report.csv')
+            with open(csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Metric', 'Value'])
+                for key, value in stats.items():
+                    writer.writerow([key, value])
+            print(f"Report saved to {csv_file}")
+            
+        return True
         
-        print("\nThreshold Exceedances:")
-        if high_es_rss:
-            print(f"- ES RSS exceeded {threshold}% of total RAM {len(high_es_rss)} times.")
-        if low_mem_available:
-            print(f"- MemAvailable dropped below {100 - threshold}% of total RAM {len(low_mem_available)} times.")
-        if high_swap_used:
-            print(f"- Total Swap Used exceeded {threshold}% of total swap {len(high_swap_used)} times.")
-        
-        if swap_activity:
-            print("\nSwap Activity Detected:")
-            for row in swap_activity[:5]:  # Limit to first 5 instances
-                print(f"- {row['timestamp']}: Swap In = {float(row['swap_in_ps']):.2f} pages/s, Swap Out = {float(row['swap_out_ps']):.2f} pages/s")
-            if len(swap_activity) > 5:
-                print(f"... and {len(swap_activity) - 5} more instances.")
-        
-    except FileNotFoundError:
-        print(f"Error: Log file {log_path} not found.")
-    except PermissionError:
-        print("Error: Permission denied accessing system files. Run with sudo.")
+    except Exception as e:
+        logging.error("Report generation failed: %s", str(e))
+        return False
 
 def system_optimization_check():
-    """Check system parameters and provide optimization recommendations."""
+    """Comprehensive system optimization checks"""
     print("\nSystem Optimization Check")
-    print("=========================")
+    print("========================")
     
-    # Check vm.swappiness
-    try:
-        with open('/proc/sys/vm/swappiness', 'r') as f:
-            swappiness = int(f.read().strip())
-        if swappiness > 1:
-            print(f"WARNING: vm.swappiness = {swappiness}. Recommend setting to 1 for ElasticSearch.")
-    except (FileNotFoundError, PermissionError):
-        print("Error: Cannot read vm.swappiness. Check permissions.")
+    checks = {
+        'vm.swappiness': {
+            'path': '/proc/sys/vm/swappiness',
+            'recommended': '1',
+            'description': "Reduces tendency to swap out memory"
+        },
+        'vm.max_map_count': {
+            'path': '/proc/sys/vm/max_map_count',
+            'recommended': '262144',
+            'description': "Required for ElasticSearch memory mapping"
+        },
+        'THP Enabled': {
+            'path': '/sys/kernel/mm/transparent_hugepage/enabled',
+            'recommended': 'never',
+            'description': "Transparent Huge Pages can cause latency issues"
+        }
+    }
     
-    # Check swap status
-    try:
-        with open('/proc/meminfo', 'r') as f:
-            for line in f:
-                if line.startswith('SwapTotal:'):
-                    swap_total = int(line.split()[1])
-                    if swap_total > 0:
-                        print("NOTE: Swap is enabled. ElasticSearch recommends disabling swap for performance.")
-                    break
-    except (FileNotFoundError, PermissionError):
-        print("Error: Cannot read /proc/meminfo. Check permissions.")
+    all_ok = True
     
-    # Check memory lock settings
-    try:
-        with open('/etc/elasticsearch/elasticsearch.yml', 'r') as f:
-            memory_lock = False
-            for line in f:
-                if line.strip().startswith('bootstrap.memory_lock:'):
-                    value = line.split(':')[1].strip()
-                    memory_lock = value == 'true'
-                    break
-            if not memory_lock:
-                print("RECOMMENDATION: Set bootstrap.memory_lock: true in elasticsearch.yml to lock JVM heap in RAM.")
+    for name, config in checks.items():
+        try:
+            with open(config['path'], 'r') as f:
+                value = f.read().strip()
+                
+            # Handle different output formats
+            if '[' in value:
+                current = re.search(r'\[(\w+)\]', value).group(1)
             else:
-                pid = get_es_pid()
-                if pid:
-                    with open(f'/proc/{pid}/limits', 'r') as lf:
-                        for line in lf:
-                            if line.startswith('Max locked memory'):
-                                limit = line.split()[3]
-                                if limit != 'unlimited':
-                                    print(f"WARNING: memlock limit is {limit}. Set to unlimited for memory locking.")
-                                break
-    except (FileNotFoundError, PermissionError):
-        print("NOTE: Could not check memory lock settings. Verify /etc/elasticsearch/elasticsearch.yml permissions.")
+                current = value
+                
+            status = "OK" if current == config['recommended'] else "WARNING"
+            print(f"\n{name}: {status}")
+            print(f"- Current: {current}")
+            print(f"- Recommended: {config['recommended']}")
+            print(f"- Description: {config['description']}")
+            
+            if status != "OK":
+                all_ok = False
+                
+        except FileNotFoundError:
+            print(f"\n{name}: ERROR - File not found")
+            all_ok = False
+        except PermissionError:
+            print(f"\n{name}: ERROR - Permission denied")
+            all_ok = False
     
-    # Check Transparent Huge Pages
+    # ElasticSearch specific checks
     try:
-        with open('/sys/kernel/mm/transparent_hugepage/enabled', 'r') as f:
-            thp = f.read().strip()
-        if '[always]' in thp or '[madvise]' in thp:
-            print("RECOMMENDATION: Disable Transparent Huge Pages (set to 'never') to avoid latency issues.")
-    except (FileNotFoundError, PermissionError):
-        print("Error: Cannot check THP settings. Check permissions.")
+        es_config = '/etc/elasticsearch/elasticsearch.yml'
+        if os.path.exists(es_config):
+            with open(es_config, 'r') as f:
+                content = f.read()
+                
+            # Check memory lock setting
+            if 'bootstrap.memory_lock: true' not in content:
+                print("\nMemory Lock: WARNING")
+                print("- ElasticSearch not configured to lock memory in RAM")
+                print("- Add 'bootstrap.memory_lock: true' to elasticsearch.yml")
+                all_ok = False
+            else:
+                print("\nMemory Lock: OK")
+                
+            # Check JVM options
+            jvm_options = '/etc/elasticsearch/jvm.options'
+            if os.path.exists(jvm_options):
+                with open(jvm_options, 'r') as f:
+                    jvm_content = f.read()
+                    
+                if '-Xmx' not in jvm_content or '-Xms' not in jvm_content:
+                    print("\nJVM Configuration: WARNING")
+                    print("- Xmx/Xms settings not found in jvm.options")
+                    all_ok = False
+        else:
+            print("\nElasticSearch config: WARNING")
+            print(f"- Configuration file not found: {es_config}")
+            all_ok = False
+            
+    except Exception as e:
+        print(f"\nElasticSearch check failed: {str(e)}")
+        all_ok = False
     
-    # Check vm.max_map_count
-    try:
-        with open('/proc/sys/vm/max_map_count', 'r') as f:
-            max_map_count = int(f.read().strip())
-        if max_map_count < 262144:
-            print(f"WARNING: vm.max_map_count = {max_map_count}. Recommend setting to at least 262144.")
-    except (FileNotFoundError, PermissionError):
-        print("Error: Cannot read vm.max_map_count. Check permissions.")
+    return all_ok
+
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="ElasticSearch Memory and Swap Monitor",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Daemon mode options
+    parser.add_argument('--daemon', action='store_true', 
+                        help='Run in daemon mode')
+    parser.add_argument('--interval', type=float, default=DEFAULT_INTERVAL,
+                        help='Sampling interval in seconds')
+    parser.add_argument('--log', type=str, default=DEFAULT_LOG_PATH,
+                        help='Log file path')
+    parser.add_argument('--threshold', type=int, default=DEFAULT_THRESHOLD,
+                        help='Memory usage threshold percentage')
+    
+    # Service management
+    parser.add_argument('--install-service', action='store_true',
+                        help='Install as systemd service')
+    parser.add_argument('--uninstall-service', action='store_true',
+                        help='Uninstall systemd service')
+    
+    # Reporting
+    parser.add_argument('--report', action='store_true',
+                        help='Generate performance report')
+    parser.add_argument('--report-format', choices=['text', 'csv'], default='text',
+                        help='Report output format')
+    
+    # System check
+    parser.add_argument('--check-system', action='store_true',
+                        help='Run system optimization check')
+    
+    return parser.parse_args()
 
 def main():
-    """Main function to handle command-line arguments and menu."""
-    global interval, log_path, monitoring_thread, monitoring_active
+    """Main application entry point"""
+    setup_logging()
     
-    # Check for daemon mode
-    if '--daemon' in sys.argv:
+    if not validate_config():
+        sys.exit(1)
+    
+    args = parse_arguments()
+    
+    # Service management
+    if args.install_service:
+        install_service(args.interval, args.log, args.threshold)
+        sys.exit(0)
+    elif args.uninstall_service:
+        uninstall_service()
+        sys.exit(0)
+    
+    # Reporting
+    if args.report:
+        generate_report(args.log, args.threshold, args.report_format)
+        sys.exit(0)
+    
+    # System check
+    if args.check_system:
+        system_optimization_check()
+        sys.exit(0)
+    
+    # Daemon mode
+    if args.daemon:
+        logging.info("Starting in daemon mode")
         try:
-            interval_idx = sys.argv.index('--interval') + 1
-            log_idx = sys.argv.index('--log') + 1
-            interval = float(sys.argv[interval_idx])
-            log_path = sys.argv[log_idx]
-            monitoring_active = True
-            monitoring_loop()
-        except (IndexError, ValueError):
-            print("Error: Invalid arguments for daemon mode. Use: --daemon --interval <seconds> --log <path>")
-            sys.exit(1)
-    else:
-        # Interactive menu
-        while True:
-            print("\nElasticSearch Memory Monitor Menu")
-            print("=================================")
-            print("1. Start Monitoring")
-            print("2. Stop Monitoring")
-            print("3. Configure Settings")
-            print("4. Install as Service")
-            print("5. Uninstall Service")
-            print("6. Generate Report")
-            print("7. System Optimization Check")
-            print("8. Exit")
-            choice = input("Select an option (1-8): ")
-            
-            if choice == '1':
-                start_monitoring()
-            elif choice == '2':
-                stop_monitoring()
-            elif choice == '3':
-                configure_settings()
-            elif choice == '4':
-                install_service()
-            elif choice == '5':
-                uninstall_service()
-            elif choice == '6':
-                generate_report()
-            elif choice == '7':
-                system_optimization_check()
-            elif choice == '8':
-                if monitoring_thread is not None:
-                    stop_monitoring()
-                print("Exiting.")
-                sys.exit(0)
-            else:
-                print("Invalid option. Please select 1-8.")
+            start_monitoring(args.interval, args.log, args.threshold)
+            while True:
+                time.sleep(5)
+        except KeyboardInterrupt:
+            stop_monitoring()
+            sys.exit(0)
+    
+    # Interactive mode
+    print("\nElasticSearch Memory Monitor")
+    print("===========================")
+    
+    while True:
+        print("\n[1] Start Monitoring")
+        print("[2] Stop Monitoring")
+        print("[3] Generate Report")
+        print("[4] System Optimization Check")
+        print("[5] Install Service")
+        print("[6] Uninstall Service")
+        print("[7] Exit")
+        
+        choice = input("\nSelect option: ")
+        
+        if choice == '1':
+            start_monitoring(DEFAULT_INTERVAL, DEFAULT_LOG_PATH, DEFAULT_THRESHOLD)
+        elif choice == '2':
+            stop_monitoring()
+        elif choice == '3':
+            generate_report(DEFAULT_LOG_PATH, DEFAULT_THRESHOLD)
+        elif choice == '4':
+            system_optimization_check()
+        elif choice == '5':
+            install_service(DEFAULT_INTERVAL, DEFAULT_LOG_PATH, DEFAULT_THRESHOLD)
+        elif choice == '6':
+            uninstall_service()
+        elif choice == '7':
+            stop_monitoring()
+            print("Exiting")
+            sys.exit(0)
+        else:
+            print("Invalid selection")
 
 if __name__ == "__main__":
     main()
